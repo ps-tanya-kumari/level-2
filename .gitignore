@@ -7,6 +7,7 @@ backend/venv/
 backend/.env
 
 # Local databases & analysis caches
+chroma_db/
 backend/chroma_db/
 backend/analysis_cache/
 

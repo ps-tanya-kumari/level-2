@@ -9,12 +9,12 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-def sanitize_collection_name(owner: str, repo: str) -> str:
+def sanitize_collection_name(owner: str, repo: str, suffix: str = "") -> str:
     """
     Sanitizes owner and repo names to create a valid ChromaDB collection name.
     Rules: 3-63 chars, alphanumeric/underscore/hyphen, starts/ends with alphanumeric.
     """
-    name = f"repo_{owner}_{repo}".lower()
+    name = f"repo_{owner}_{repo}{suffix}".lower()
     # Replace non-alphanumeric/hyphen/underscore with underscore
     name = re.sub(r'[^a-z0-9_-]', '_', name)
     
@@ -36,16 +36,24 @@ def sanitize_collection_name(owner: str, repo: str) -> str:
     return name
 
 class VectorStore:
-    def __init__(self):
+    def __init__(self, embed_dim: int = None):
+        if embed_dim is None:
+            # Detect dimension based on environment variables
+            if os.getenv("NVIDIA_API_KEY"):
+                embed_dim = 2048
+            else:
+                embed_dim = 768
+        self.suffix = f"_{embed_dim}"
+        
         db_dir = os.getenv("CHROMA_DB_DIR", "./chroma_db")
         # Ensure directory exists
         os.makedirs(db_dir, exist_ok=True)
         self.client = chromadb.PersistentClient(path=db_dir)
-        logger.info(f"ChromaDB PersistentClient initialized at: {db_dir}")
+        logger.info(f"ChromaDB PersistentClient initialized at: {db_dir} with suffix {self.suffix}")
 
     def get_collection(self, owner: str, repo: str):
         """Retrieve a collection for a specific repository."""
-        collection_name = sanitize_collection_name(owner, repo)
+        collection_name = sanitize_collection_name(owner, repo, self.suffix)
         try:
             return self.client.get_collection(name=collection_name)
         except Exception:
@@ -53,12 +61,12 @@ class VectorStore:
 
     def get_or_create_collection(self, owner: str, repo: str):
         """Get or create collection for a repository."""
-        collection_name = sanitize_collection_name(owner, repo)
+        collection_name = sanitize_collection_name(owner, repo, self.suffix)
         return self.client.get_or_create_collection(name=collection_name)
 
     def delete_collection(self, owner: str, repo: str):
         """Delete collection for a repository (useful to re-index)."""
-        collection_name = sanitize_collection_name(owner, repo)
+        collection_name = sanitize_collection_name(owner, repo, self.suffix)
         try:
             self.client.delete_collection(name=collection_name)
             logger.info(f"Deleted ChromaDB collection: {collection_name}")

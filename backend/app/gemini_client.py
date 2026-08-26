@@ -108,24 +108,42 @@ mcp_toolset = Tool(
 
 class GeminiClient:
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.nvidia_api_key = os.getenv("NVIDIA_API_KEY")
+        self.nvidia_api_base = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1")
+        self.nvidia_model = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+
+        self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        
         if self.api_key:
             genai.configure(api_key=self.api_key)
-            logger.info("GeminiClient initialized successfully.")
-        else:
-            logger.warning("GEMINI_API_KEY is not set.")
-        
-        self.model_name = "gemini-3.5-flash"
+            os.environ["GOOGLE_API_KEY"] = self.api_key
+            logger.info("GeminiClient initialized successfully with Gemini.")
+            
+        if self.nvidia_api_key:
+            logger.info(f"GeminiClient configured with NVIDIA NIM model: {self.nvidia_model}")
+            
+        if not self.api_key and not self.nvidia_api_key:
+            logger.warning("Neither GEMINI_API_KEY nor NVIDIA_API_KEY is configured. Will use Ollama fallback.")
 
-    async def _call_ollama(self, messages: list, tools: list = None, system_instruction: str = None) -> dict:
-        """Call Ollama's OpenAI-compatible completions endpoint."""
-        api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
-        model = os.getenv("OLLAMA_MODEL", "llama3")
-        
+    async def _call_openai_compatible(
+        self, 
+        api_key: str, 
+        api_base: str, 
+        model: str, 
+        messages: list, 
+        tools: list = None, 
+        system_instruction: str = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.2
+    ) -> dict:
+        """Call any OpenAI-compatible chat completions endpoint."""
         payload = {
             "model": model,
             "messages": [],
-            "stream": False
+            "stream": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens
         }
         
         if system_instruction:
@@ -137,22 +155,60 @@ class GeminiClient:
             payload["tools"] = tools
             
         headers = {"Content-Type": "application/json"}
-        
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            
         import httpx
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(f"{api_base}/v1/chat/completions", json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            url = api_base.rstrip('/')
+            if not url.endswith('/chat/completions'):
+                if not url.endswith('/v1'):
+                    url = f"{url}/v1/chat/completions"
+                else:
+                    url = f"{url}/chat/completions"
+            
+            response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             return response.json()
 
+    async def _call_ollama(self, messages: list, tools: list = None, system_instruction: str = None) -> dict:
+        """Call Ollama's OpenAI-compatible completions endpoint."""
+        api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
+        model = os.getenv("OLLAMA_MODEL", "llama3")
+        return await self._call_openai_compatible("", api_base, model, messages, tools, system_instruction)
+
     async def generate(self, system_instruction: str, prompt: str) -> str:
         """Standard direct text generation without tool calling."""
+        nvidia_error = None
+        if self.nvidia_api_key:
+            try:
+                messages = [{"role": "user", "content": prompt}]
+                res = await self._call_openai_compatible(
+                    api_key=self.nvidia_api_key,
+                    api_base=self.nvidia_api_base,
+                    model=self.nvidia_model,
+                    messages=messages,
+                    system_instruction=system_instruction,
+                    max_tokens=4096,
+                    temperature=0.2
+                )
+                msg = res["choices"][0]["message"]
+                content = msg.get("content")
+                if not content and "reasoning_content" in msg:
+                    content = msg.get("reasoning_content")
+                if content:
+                    return content
+            except Exception as e:
+                nvidia_error = e
+                logger.warning(f"Error in NVIDIA NIM direct generation: {e}. Falling back to Gemini...")
+
+        gemini_error = None
         if self.api_key:
             try:
                 model = genai.GenerativeModel(
                     model_name=self.model_name,
                     system_instruction=system_instruction
                 )
-                # Run in executor to prevent blocking
                 loop = asyncio.get_event_loop()
                 response = await loop.run_in_executor(
                     None, 
@@ -160,9 +216,8 @@ class GeminiClient:
                 )
                 return response.text
             except Exception as e:
+                gemini_error = e
                 logger.warning(f"Error in Gemini direct generation: {e}. Falling back to Ollama...")
-        else:
-            logger.info("GEMINI_API_KEY not set. Using Ollama for direct generation.")
 
         # Fallback to Ollama
         try:
@@ -171,10 +226,19 @@ class GeminiClient:
             return res["choices"][0]["message"]["content"]
         except Exception as oe:
             logger.error(f"Ollama direct generation fallback failed: {oe}")
-            return f"Error: Gemini failed and Ollama fallback also failed. Gemini: {locals().get('e', 'API key missing')}. Ollama: {str(oe)}"
+            errors = []
+            if nvidia_error:
+                errors.append(f"Nvidia NIM: {nvidia_error}")
+            if gemini_error:
+                errors.append(f"Gemini: {gemini_error}")
+            errors.append(f"Ollama: {oe}")
+            return f"Error: All direct generation paths failed.\n" + "\n".join(errors)
 
-    async def generate_with_mcp_ollama(
+    async def generate_with_mcp_openai_compatible(
         self, 
+        api_key: str,
+        api_base: str,
+        model: str,
         system_instruction: str, 
         chat_history: List[Dict[str, Any]], 
         mcp_tools: MCPTools, 
@@ -182,10 +246,10 @@ class GeminiClient:
         repo: str
     ) -> str:
         """
-        Executes an Ollama conversation, resolving tool/function calls using MCP.
+        Executes an OpenAI-compatible conversation, resolving tool/function calls using MCP.
         Supports dual-layer tool calling: native OpenAPI schemas or manual instruction parsing fallback.
         """
-        logger.info(f"Ollama generate_with_mcp starting for {owner}/{repo}")
+        logger.info(f"OpenAI-compatible generate_with_mcp starting for {owner}/{repo} using model {model}")
         import httpx
         
         messages = []
@@ -309,24 +373,43 @@ class GeminiClient:
 
         max_iterations = 8
         for step in range(max_iterations):
-            logger.info(f"Ollama Agent reasoning step {step+1}/{max_iterations}")
+            logger.info(f"OpenAI Agent reasoning step {step+1}/{max_iterations}")
             
             try:
                 if use_native_tools:
                     try:
-                        res = await self._call_ollama(messages, tools=openai_tools, system_instruction=system_instruction)
+                        res = await self._call_openai_compatible(
+                            api_key=api_key,
+                            api_base=api_base,
+                            model=model,
+                            messages=messages,
+                            tools=openai_tools,
+                            system_instruction=system_instruction
+                        )
                     except httpx.HTTPStatusError as hse:
-                        if hse.response.status_code == 400:
-                            logger.warning("Ollama native tool calling rejected (400). Switching to manual tool formatting fallback...")
+                        if hse.response.status_code in [400, 404, 501]:
+                            logger.warning(f"OpenAI native tool calling failed (status {hse.response.status_code}). Switching to manual tool formatting fallback...")
                             use_native_tools = False
-                            res = await self._call_ollama(messages, system_instruction=manual_system_instruction)
+                            res = await self._call_openai_compatible(
+                                api_key=api_key,
+                                api_base=api_base,
+                                model=model,
+                                messages=messages,
+                                system_instruction=manual_system_instruction
+                            )
                         else:
                             raise hse
                 else:
-                    res = await self._call_ollama(messages, system_instruction=manual_system_instruction)
+                    res = await self._call_openai_compatible(
+                        api_key=api_key,
+                        api_base=api_base,
+                        model=model,
+                        messages=messages,
+                        system_instruction=manual_system_instruction
+                    )
             except Exception as e:
-                logger.error(f"Ollama API call failed during tool loop: {e}")
-                return f"Ollama API call failed: {str(e)}"
+                logger.error(f"OpenAI API call failed during tool loop: {e}")
+                return f"OpenAI API call failed: {str(e)}"
                 
             choice = res["choices"][0]
             assistant_msg = choice["message"]
@@ -351,12 +434,10 @@ class GeminiClient:
                         except Exception:
                             args = {}
                             
-                    if "owner" not in args:
-                        args["owner"] = owner
-                    if "repo" not in args:
-                        args["repo"] = repo
+                    args["owner"] = owner
+                    args["repo"] = repo
                         
-                    logger.info(f"Ollama executing native tool call: {name}({args})")
+                    logger.info(f"OpenAI executing native tool call: {name}({args})")
                     
                     try:
                         result = None
@@ -381,7 +462,7 @@ class GeminiClient:
                         else:
                             result_str = result
                     except Exception as ex:
-                        logger.error(f"Error executing tool {name} under Ollama: {ex}")
+                        logger.error(f"Error executing tool {name}: {ex}")
                         result_str = f"Error executing tool: {str(ex)}"
                         
                     messages.append({
@@ -407,20 +488,17 @@ class GeminiClient:
                 try:
                     args = json.loads(args_str)
                 except Exception as je:
-                    logger.error(f"Ollama manual tool parsing failed to load json arguments: {je}")
-                    # Try direct eval of args in case LLM missed double quotes or output single quotes
+                    logger.error(f"OpenAI manual tool parsing failed to load json arguments: {je}")
                     try:
                         import ast
                         args = ast.literal_eval(args_str)
                     except Exception:
                         args = {}
                     
-                if "owner" not in args:
-                    args["owner"] = owner
-                if "repo" not in args:
-                    args["repo"] = repo
+                args["owner"] = owner
+                args["repo"] = repo
                     
-                logger.info(f"Ollama executing manual tool call: {name}({args})")
+                logger.info(f"OpenAI executing manual tool call: {name}({args})")
                 
                 try:
                     result = None
@@ -444,7 +522,7 @@ class GeminiClient:
                     else:
                         result_str = result
                 except Exception as ex:
-                    logger.error(f"Error executing manual tool {name} under Ollama: {ex}")
+                    logger.error(f"Error executing manual tool {name}: {ex}")
                     result_str = f"Error executing tool: {str(ex)}"
                     
                 messages.append({
@@ -452,8 +530,29 @@ class GeminiClient:
                     "content": f"TOOL_RESPONSE: {result_str}"
                 })
                 
-        return "Ollama Agent execution terminated because it reached the maximum tool call limit."
+        return "OpenAI Agent execution terminated because it reached the maximum tool call limit."
 
+    async def generate_with_mcp_ollama(
+        self, 
+        system_instruction: str, 
+        chat_history: List[Dict[str, Any]], 
+        mcp_tools: MCPTools, 
+        owner: str, 
+        repo: str
+    ) -> str:
+        """Executes an Ollama conversation, resolving tool/function calls using MCP."""
+        api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
+        model = os.getenv("OLLAMA_MODEL", "llama3")
+        return await self.generate_with_mcp_openai_compatible(
+            api_key="",
+            api_base=api_base,
+            model=model,
+            system_instruction=system_instruction,
+            chat_history=chat_history,
+            mcp_tools=mcp_tools,
+            owner=owner,
+            repo=repo
+        )
 
     async def generate_with_mcp(
         self, 
@@ -464,9 +563,28 @@ class GeminiClient:
         repo: str
     ) -> str:
         """
-        Executes a Gemini conversation, intercepting and resolving tool/function calls using MCP.
-        Supports multi-turn tool loops. If Gemini fails or key is missing, falls back to Ollama.
+        Executes a conversation, intercepting and resolving tool/function calls using MCP.
+        Supports multi-turn tool loops. If NVIDIA NIM is configured, uses NVIDIA.
+        If Gemini is configured, uses Gemini. Otherwise, falls back to Ollama.
         """
+        nvidia_error = None
+        if self.nvidia_api_key:
+            try:
+                return await self.generate_with_mcp_openai_compatible(
+                    api_key=self.nvidia_api_key,
+                    api_base=self.nvidia_api_base,
+                    model=self.nvidia_model,
+                    system_instruction=system_instruction,
+                    chat_history=chat_history,
+                    mcp_tools=mcp_tools,
+                    owner=owner,
+                    repo=repo
+                )
+            except Exception as e:
+                nvidia_error = e
+                logger.warning(f"Nvidia NIM tool calling loop failed: {e}. Falling back...")
+
+        gemini_error = None
         if self.api_key:
             try:
                 model = genai.GenerativeModel(
@@ -510,10 +628,8 @@ class GeminiClient:
                         name = call.name
                         args = dict(call.args)
                         
-                        if "owner" not in args:
-                            args["owner"] = owner
-                        if "repo" not in args:
-                            args["repo"] = repo
+                        args["owner"] = owner
+                        args["repo"] = repo
                         
                         logger.info(f"Executing tool call: {name}({args})")
                         
@@ -564,15 +680,25 @@ class GeminiClient:
                 return "Agent execution terminated because it reached the maximum tool call limit."
 
             except Exception as e:
+                gemini_error = e
                 logger.warning(f"Gemini API call failed during tool loop: {e}. Falling back to Ollama...")
-        else:
-            logger.info("GEMINI_API_KEY not configured. Falling back to Ollama...")
 
-        # Run with Ollama E2E
-        return await self.generate_with_mcp_ollama(
-            system_instruction=system_instruction,
-            chat_history=chat_history,
-            mcp_tools=mcp_tools,
-            owner=owner,
-            repo=repo
-        )
+        try:
+            # Run with Ollama E2E
+            return await self.generate_with_mcp_ollama(
+                system_instruction=system_instruction,
+                chat_history=chat_history,
+                mcp_tools=mcp_tools,
+                owner=owner,
+                repo=repo
+            )
+        except Exception as oe:
+            logger.error(f"Ollama tool loop fallback failed: {oe}")
+            errors = []
+            if nvidia_error:
+                errors.append(f"Nvidia NIM: {nvidia_error}")
+            if gemini_error:
+                errors.append(f"Gemini: {gemini_error}")
+            errors.append(f"Ollama: {oe}")
+            return "Error: All tool calling loops failed.\n" + "\n".join(errors)
+

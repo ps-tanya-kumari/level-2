@@ -130,46 +130,97 @@ Required JSON Schema:
 """
         response_text = await self.gemini_client.generate(system_instruction, prompt)
         
-        # Clean up response text in case Gemini wraps in markdown backticks
-        response_text = response_text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        response_text = response_text.strip()
-
-        try:
-            analysis_data = json.loads(response_text)
-            # Cache the summary
+        analysis_data = self._extract_json(response_text)
+        if analysis_data and "overview" in analysis_data and "workflow" in analysis_data:
+            # Ensure overview and workflow have the required dictionary keys
+            overview = analysis_data.get("overview", {})
+            workflow = analysis_data.get("workflow", {})
+            
+            # Normalize fields to avoid frontend crashes
+            overview.setdefault("project_name", repo)
+            overview.setdefault("description", "Repository overview analysis.")
+            overview.setdefault("problem_solved", "N/A")
+            overview.setdefault("technologies", [])
+            overview.setdefault("languages", [])
+            overview.setdefault("dependencies", [])
+            overview.setdefault("features", [])
+            overview.setdefault("important_files", [])
+            overview.setdefault("explanation", "")
+            
+            workflow.setdefault("diagram", "Workflow diagram not specified.")
+            workflow.setdefault("starting_point", "N/A")
+            workflow.setdefault("execution_flow", "N/A")
+            workflow.setdefault("frontend_backend", "N/A")
+            workflow.setdefault("api_flow", "N/A")
+            workflow.setdefault("database_interaction", "N/A")
+            workflow.setdefault("processing_steps", "N/A")
+            workflow.setdefault("final_output", "N/A")
+            
+            # Cache the valid summary
             self.mcp_tools.save_project_summary(owner, repo, analysis_data)
             return analysis_data
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON response from Gemini: {response_text}. Error: {e}")
-            # Return partial structures if JSON fails
-            fallback = {
-                "overview": {
-                    "project_name": repo,
-                    "description": "Failed to parse analysis JSON. Please try again.",
-                    "problem_solved": "Unknown",
-                    "technologies": [],
-                    "languages": [],
-                    "dependencies": [],
-                    "features": [],
-                    "important_files": [],
-                    "explanation": response_text
-                },
-                "workflow": {
-                    "diagram": "Error parsing workflow details",
-                    "starting_point": "Unknown",
-                    "execution_flow": "Unknown",
-                    "frontend_backend": "Unknown",
-                    "api_flow": "Unknown",
-                    "database_interaction": "Unknown",
-                    "processing_steps": "Unknown",
-                    "final_output": "Unknown"
-                }
+
+        logger.error(f"Failed to parse JSON response from LLM: {response_text}")
+        # Return fallback without caching it to disk so future requests can retry successfully
+        return {
+            "overview": {
+                "project_name": repo,
+                "description": "Failed to generate analysis. Please click retry or re-index the repository.",
+                "problem_solved": "Unknown",
+                "technologies": [],
+                "languages": [],
+                "dependencies": [],
+                "features": [],
+                "important_files": [],
+                "explanation": response_text
+            },
+            "workflow": {
+                "diagram": "Error parsing workflow details",
+                "starting_point": "Unknown",
+                "execution_flow": "Unknown",
+                "frontend_backend": "Unknown",
+                "api_flow": "Unknown",
+                "database_interaction": "Unknown",
+                "processing_steps": "Unknown",
+                "final_output": "Unknown"
             }
-            self.mcp_tools.save_project_summary(owner, repo, fallback)
-            return fallback
+        }
+
+    def _extract_json(self, text: str) -> Dict[str, Any]:
+        """Extract and parse JSON from model response text even if markdown-wrapped or preceded by text."""
+        import re
+        if not text:
+            return None
+            
+        clean_text = text.strip()
+        
+        # 1. Try direct parse
+        try:
+            return json.loads(clean_text)
+        except Exception:
+            pass
+            
+        # 2. Try markdown code block regex
+        code_block = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean_text)
+        if code_block:
+            try:
+                return json.loads(code_block.group(1).strip())
+            except Exception:
+                pass
+                
+        # 3. Try finding outermost { ... }
+        start_idx = clean_text.find('{')
+        end_idx = clean_text.rfind('}')
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_substr = clean_text[start_idx:end_idx+1]
+            try:
+                return json.loads(json_substr)
+            except Exception:
+                # 4. Clean trailing commas in lists or objects
+                cleaned = re.sub(r',\s*([\]}])', r'\1', json_substr)
+                try:
+                    return json.loads(cleaned)
+                except Exception:
+                    pass
+
+        return None

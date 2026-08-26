@@ -177,6 +177,24 @@ export default function App() {
     }
   };
 
+  // Re-trigger analysis for currently selected repository
+  const handleReanalyze = async () => {
+    if (!selectedRepo) return;
+    setIndexingStatus({ status: 'indexing', progress: 0, message: 'Re-analyzing repository...' });
+    try {
+      const res = await fetch(`${API_BASE}/api/github/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ owner: selectedRepo.owner, repo: selectedRepo.name })
+      });
+      const data = await res.json();
+      setIndexingStatus(data.status);
+    } catch (err) {
+      console.error(err);
+      setIndexingStatus({ status: 'failed', progress: 0, message: 'Failed to trigger re-analysis.' });
+    }
+  };
+
   // Poll indexing status if in progress
   useEffect(() => {
     let interval = null;
@@ -542,10 +560,32 @@ export default function App() {
                 {/* TAB 1: OVERVIEW */}
                 {activeTab === 'overview' && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
-                    <div style={{ borderBottom: '1px solid var(--border-muted)', paddingBottom: '1rem' }}>
-                      <h2 style={{ fontSize: '1.5rem', fontWeight: '700' }}>Project Overview</h2>
-                      <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginTop: '0.2rem' }}>AI-generated structural analysis of the codebase</p>
+                    <div style={{ borderBottom: '1px solid var(--border-muted)', paddingBottom: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+                      <div>
+                        <h2 style={{ fontSize: '1.5rem', fontWeight: '700' }}>Project Overview</h2>
+                        <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginTop: '0.2rem' }}>AI-generated structural analysis of the codebase</p>
+                      </div>
+                      <button 
+                        className="btn btn-secondary" 
+                        onClick={handleReanalyze}
+                        style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem' }}
+                      >
+                        <RefreshCw size={14} />
+                        Re-analyze Repository
+                      </button>
                     </div>
+
+                    {analysisData.overview.description.startsWith('Failed to') && (
+                      <div style={{ padding: '1rem', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#FCA5A5' }}>
+                          <AlertCircle size={20} />
+                          <span>The analysis could not be parsed properly. Click Re-analyze to generate a fresh overview.</span>
+                        </div>
+                        <button className="btn btn-primary" onClick={handleReanalyze} style={{ fontSize: '0.8rem', padding: '6px 12px' }}>
+                          Retry Now
+                        </button>
+                      </div>
+                    )}
 
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
                       <div>

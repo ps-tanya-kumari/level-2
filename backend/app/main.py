@@ -49,8 +49,8 @@ analysis_status: Dict[str, Dict[str, Any]] = {}
 async def startup_event():
     logger.info("Initializing application dependencies...")
     github_client = GitHubClient()
-    vector_store = VectorStore()
     embeddings = GeminiEmbeddings()
+    vector_store = VectorStore(embed_dim=embeddings.get_dimension())
     gemini_client = GeminiClient()
     
     app_state["github_client"] = github_client

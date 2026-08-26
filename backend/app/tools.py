@@ -118,6 +118,13 @@ class MCPTools:
 
     def save_project_summary(self, owner: str, repo: str, summary_data: Dict[str, Any]):
         """Save a generated overview/summary to local cache."""
+        if not summary_data or not isinstance(summary_data, dict):
+            return
+        overview_desc = summary_data.get("overview", {}).get("description", "")
+        if "Failed to parse analysis JSON" in overview_desc or "Failed to generate analysis" in overview_desc:
+            logger.warning(f"Refusing to save failed project summary to cache for {owner}/{repo}")
+            return
+            
         cache_path = self._get_cache_path(owner, repo)
         try:
             with open(cache_path, 'w', encoding='utf-8') as f:
@@ -134,7 +141,13 @@ class MCPTools:
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    desc = data.get("overview", {}).get("description", "")
+                    if "Failed to parse analysis JSON" in desc or "Failed to generate analysis" in desc:
+                        # Clean up bad cache
+                        os.remove(cache_path)
+                        return {"error": "Previous cached summary was invalid."}
+                    return data
             except Exception as e:
                 logger.error(f"Error reading project summary cache: {e}")
         return {"error": "Project overview has not been generated or cached yet."}
