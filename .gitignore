@@ -1,0 +1,30 @@
+# Python Virtual Environments & Dependencies
+backend/venv/
+**/__pycache__/
+*.pyc
+
+# Local secrets & configuration
+backend/.env
+
+# Local databases & analysis caches
+backend/chroma_db/
+backend/analysis_cache/
+
+# Node modules & build files
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# Logs
+*.log
+logs/
+
+# Editor and OS settings
+.vscode/
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
